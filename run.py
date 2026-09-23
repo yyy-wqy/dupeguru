@@ -11,7 +11,7 @@ import gc
 
 from PyQt5.QtCore import QCoreApplication
 from PyQt5.QtGui import QIcon, QPixmap
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QDialog
 
 from hscommon.trans import install_gettext_trans_under_qt
 from qt.error_report_dialog import install_excepthook
@@ -54,6 +54,16 @@ def main():
     setup_qt_logging()
     settings = create_qsettings()
     lang = settings.value("Language")
+    if not lang:
+        # First run: ask for the interface language before building the UI, so that it is
+        # displayed in the chosen language right away (no restart needed).
+        from qt.language_dialog import LanguageDialog
+
+        dialog = LanguageDialog()
+        if dialog.exec() == QDialog.Accepted:
+            lang = dialog.selectedLanguage()
+            settings.setValue("Language", lang)
+            settings.sync()
     locale_folder = op.join(BASE_PATH, "locale")
     install_gettext_trans_under_qt(locale_folder, lang)
     # Handle OS signals

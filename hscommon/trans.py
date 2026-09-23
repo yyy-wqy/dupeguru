@@ -152,14 +152,24 @@ def install_gettext_trans_under_qt(base_folder: os.PathLike, lang: str = None) -
         locale.setlocale(locale.LC_ALL, localename)
     except locale.Error:
         logging.warning("Couldn't set locale %s", localename)
-    qmname = "qt_%s" % lang
-    if ISLINUX:
-        # Under linux, a full Qt installation is already available in the system, we didn't bundle
-        # up the qm files in our package, so we have to load translations from the system.
-        qmpath = op.join(QLibraryInfo.location(QLibraryInfo.TranslationsPath), qmname)
-    else:
-        qmpath = op.join(base_folder, qmname)
-    qtr = QTranslator(QCoreApplication.instance())
-    qtr.load(qmpath)
-    QCoreApplication.installTranslator(qtr)
+    qt_translations_path = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
+    # Qt's own translations are split across several catalogs: qt_<lang> holds a few global
+    # strings, while qtbase_<lang> holds the QtWidgets strings (standard button labels such as
+    # OK/Cancel/Restore Defaults, etc.). Load both so standard buttons and dialogs get translated.
+    for qmname in ("qt_%s" % lang, "qtbase_%s" % lang):
+        if ISLINUX:
+            # Under linux, a full Qt installation is already available in the system, we didn't
+            # bundle up the qm files in our package, so we have to load translations from the system.
+            qmpaths = [op.join(qt_translations_path, qmname)]
+        else:
+            # Prefer the app-bundled translation, then fall back to the Qt installation's own
+            # translations. The fallback matters when running from source: the qt*.qm files are
+            # normally not in the repo (build.py only bundles the gettext .mo files), so without it
+            # Qt's standard buttons and dialogs stay in English.
+            qmpaths = [op.join(base_folder, qmname), op.join(qt_translations_path, qmname)]
+        qtr = QTranslator(QCoreApplication.instance())
+        for qmpath in qmpaths:
+            if qtr.load(qmpath):
+                break
+        QCoreApplication.installTranslator(qtr)
     install_gettext_trans(base_folder, lang)

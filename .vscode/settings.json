@@ -8,10 +8,13 @@
         120
     ],
     "python.languageServer": "Pylance",
+    "python.defaultInterpreterPath": "D:\\anaconda\\python.exe",
     "yaml.schemaStore.enable": true,
     "[python]": {
         "editor.formatOnSave": true,
         "editor.defaultFormatter": "ms-python.black-formatter"
     },
-    "python.testing.pytestEnabled": true
+    "python.testing.pytestEnabled": true,
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
