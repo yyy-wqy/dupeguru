@@ -5,9 +5,10 @@
 # http://www.gnu.org/licenses/gpl-3.0.html
 
 import sys
+import threading
 import os.path as op
 
-from PyQt5.QtCore import QTimer, QObject, QUrl, pyqtSignal, Qt
+from PyQt5.QtCore import QThread, QTimer, QObject, QUrl, pyqtSignal, Qt
 from PyQt5.QtGui import QColor, QDesktopServices, QPalette
 from PyQt5.QtWidgets import QApplication, QFileDialog, QDialog, QMessageBox, QStyleFactory, QToolTip
 
@@ -20,6 +21,7 @@ from qt.util import create_actions
 from qt.progress_window import ProgressWindow
 
 from core.app import AppMode, DupeGuru as DupeGuruModel
+from core.zip_scan import ZipThresholdAction
 import core.pe.photo
 from qt import platform
 from qt.preferences import Preferences
@@ -44,9 +46,11 @@ tr = trget("ui")
 class DupeGuru(QObject):
     LOGO_NAME = "logo_se"
     NAME = "dupeGuru"
+    zipThresholdDecisionRequested = pyqtSignal(str, int, object)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.zipThresholdDecisionRequested.connect(self._show_zip_threshold_dialog)
         self.prefs = Preferences()
         self.prefs.load()
         # Enable tabs instead of separate floating windows for each dialog
@@ -409,6 +413,46 @@ class DupeGuru(QObject):
 
     def ask_yes_no(self, prompt):
         return self.confirm("", prompt)
+
+    def choose_zip_scan_action(self, container, uncompressed_size):
+        """Ask on the GUI thread how a large ZIP should be handled."""
+        if QThread.currentThread() is self.thread():
+            return self._ask_zip_threshold_action(str(container.path), uncompressed_size)
+        response = {}
+        completed = threading.Event()
+        self.zipThresholdDecisionRequested.emit(str(container.path), uncompressed_size, (response, completed))
+        completed.wait()
+        return response["action"]
+
+    def _show_zip_threshold_dialog(self, archive_path, uncompressed_size, response_state):
+        response, completed = response_state
+        try:
+            response["action"] = self._ask_zip_threshold_action(archive_path, uncompressed_size)
+        finally:
+            completed.set()
+
+    def _ask_zip_threshold_action(self, archive_path, uncompressed_size):
+        window = QApplication.activeWindow()
+        message = tr(
+            "The uncompressed contents of this ZIP are large ({size:.1f} MiB):\n{path}\n\n"
+            "Continue internal analysis, skip this ZIP, or cancel the entire scan?"
+        ).format(size=uncompressed_size / (2**20), path=archive_path)
+        dialog = QMessageBox(
+            QMessageBox.Warning,
+            tr("Large ZIP archive"),
+            message,
+            QMessageBox.NoButton,
+            window,
+        )
+        continue_button = dialog.addButton(tr("Continue scanning"), QMessageBox.AcceptRole)
+        skip_button = dialog.addButton(tr("Skip this ZIP"), QMessageBox.DestructiveRole)
+        dialog.addButton(tr("Cancel scan"), QMessageBox.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() is continue_button:
+            return ZipThresholdAction.CONTINUE
+        if dialog.clickedButton() is skip_button:
+            return ZipThresholdAction.SKIP
+        return ZipThresholdAction.CANCEL
 
     def create_results_window(self):
         """Creates resultWindow and details_dialog depending on the selected ``app_mode``."""

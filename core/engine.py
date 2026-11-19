@@ -465,6 +465,8 @@ class Group:
 
     def switch_ref(self, with_dupe):
         """Make the :attr:`ref` dupe of the group switch position with ``with_dupe``."""
+        if getattr(with_dupe, "is_virtual", False):
+            return False
         if self.ref.is_ref:
             return False
         try:

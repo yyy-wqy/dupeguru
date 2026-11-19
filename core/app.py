@@ -30,6 +30,7 @@ from core import directories, results, export, fs, prioritize
 from core.ignore import IgnoreList
 from core.exclude import ExcludeDict as ExcludeList
 from core.scanner import ScanType
+from core.zip_scan import ReadOnlyVirtualFileError, is_virtual_file
 from core.gui.deletion_options import DeletionOptions
 from core.gui.details_panel import DetailsPanel
 from core.gui.directory_tree import DirectoryTree
@@ -232,6 +233,8 @@ class DupeGuru(Broadcaster):
         self.results.perform_on_marked(op, True)
 
     def _do_delete_dupe(self, dupe, link_deleted, use_hardlinks, direct_deletion):
+        if is_virtual_file(dupe):
+            raise ReadOnlyVirtualFileError(dupe)
         if not dupe.path.exists():
             return
         logging.debug("Sending '%s' to trash", dupe.path)
@@ -269,7 +272,8 @@ class DupeGuru(Broadcaster):
         columns = [col for col in self.result_table._columns.ordered_columns if col.visible and col.name != "marked"]
         colnames = [col.display for col in columns]
         rows = []
-        for group_id, group in enumerate(self.results.groups):
+        groups = list(self.results.groups) + list(self.results.readonly_groups)
+        for group_id, group in enumerate(groups):
             for dupe in group:
                 data = self.get_display_info(dupe, group)
                 row = [fix_surrogate_encoding(data[col.name]) for col in columns]
@@ -296,10 +300,13 @@ class DupeGuru(Broadcaster):
         if jobid == JobType.SCAN:
             self._results_changed()
             fs.filesdb.commit()
-            if not self.results.groups:
+            if not self.results.groups and not self.results.readonly_groups:
                 self.view.show_message(tr("No duplicates found."))
             else:
                 self.view.show_results_window()
+            if self.results.problems:
+                self.problem_dialog.refresh()
+                self.view.show_problem_dialog()
         if jobid in {JobType.MOVE, JobType.DELETE}:
             self._results_changed()
         if jobid == JobType.LOAD:
@@ -427,6 +434,8 @@ class DupeGuru(Broadcaster):
         fs.filesdb.clear()
 
     def copy_or_move(self, dupe, copy: bool, destination: str, dest_type: DestType):
+        if is_virtual_file(dupe):
+            raise ReadOnlyVirtualFileError(dupe)
         source_path = dupe.path
         location_path = first(p for p in self.directories if p in dupe.path.parents)
         dest_path = Path(destination)
@@ -539,9 +548,9 @@ class DupeGuru(Broadcaster):
             msg = tr("You have no custom command set up. Set it up in your preferences.")
             self.view.show_message(msg)
             return
-        if not self.selected_dupes:
+        dupes = [dupe for dupe in self.selected_dupes if not is_virtual_file(dupe)]
+        if not dupes:
             return
-        dupes = self.selected_dupes
         refs = [self.results.get_group_of_duplicate(dupe).ref for dupe in dupes]
         for dupe, ref in zip(dupes, refs):
             dupe_cmd = cmd.replace("%d", str(dupe.path))
@@ -658,9 +667,10 @@ class DupeGuru(Broadcaster):
 
     def open_selected(self):
         """Open :attr:`selected_dupes` with their associated application."""
-        if len(self.selected_dupes) > 10 and not self.view.ask_yes_no(MSG_MANY_FILES_TO_OPEN):
+        selected = [dupe for dupe in self.selected_dupes if not is_virtual_file(dupe)]
+        if len(selected) > 10 and not self.view.ask_yes_no(MSG_MANY_FILES_TO_OPEN):
             return
-        for dupe in self.selected_dupes:
+        for dupe in selected:
             desktop.open_path(dupe.path)
 
     def purge_ignore_list(self):
@@ -724,6 +734,8 @@ class DupeGuru(Broadcaster):
         """
         try:
             d = self.selected_dupes[0]
+            if is_virtual_file(d):
+                return False
             d.rename(newname)
             return True
         except (IndexError, fs.FSError) as e:
@@ -750,8 +762,9 @@ class DupeGuru(Broadcaster):
         self.view.show_message(msg)
 
     def reveal_selected(self):
-        if self.selected_dupes:
-            desktop.reveal_path(self.selected_dupes[0].path)
+        selected = [dupe for dupe in self.selected_dupes if not is_virtual_file(dupe)]
+        if selected:
+            desktop.reveal_path(selected[0].path)
 
     def save(self):
         if not op.exists(self.appdata):
@@ -792,6 +805,8 @@ class DupeGuru(Broadcaster):
         Scans folders selected in :attr:`directories` and put the results in :attr:`results`
         """
         scanner = self.SCANNER_CLASS()
+        if hasattr(self.view, "choose_zip_scan_action"):
+            scanner.zip_threshold_decider = self.view.choose_zip_scan_action
         fs.filesdb.ignore_mtime = self.options["rehash_ignore_mtime"] is True
         if not self.directories.has_any_file():
             self.view.show_message(tr("The selected directories contain no scannable file."))
@@ -819,6 +834,20 @@ class DupeGuru(Broadcaster):
                 files = self._remove_hardlink_dupes(files)
             logging.info("Scanning %d files" % len(files))
             self.results.groups = scanner.get_dupe_groups(files, self.ignore_list, j)
+            self.results.readonly_groups = scanner.readonly_groups
+            self.results.zip_subset_hints = scanner.zip_subset_hints
+            self.results.problems = []
+            for problem in scanner.zip_problems:
+                message = problem.message
+                if problem.member_path:
+                    message = tr("{} Member: {}").format(message, problem.member_path)
+                self.results.problems.append((problem.container, message))
+            for hint in scanner.zip_subset_hints:
+                message = tr(
+                    "This ZIP's contents are a proper subset of '{}'. This is only a hint; "
+                    "no duplicate group was created."
+                ).format(hint.superset.name)
+                self.results.problems.append((hint.subset, message))
             self.discarded_file_count = scanner.discarded_file_count
             if profile_scan:
                 pr.disable()
@@ -840,7 +869,14 @@ class DupeGuru(Broadcaster):
 
     def without_ref(self, dupes):
         """Returns ``dupes`` with all reference elements removed."""
-        return [dupe for dupe in dupes if self.results.get_group_of_duplicate(dupe).ref is not dupe]
+        result = []
+        for dupe in dupes:
+            if is_virtual_file(dupe):
+                continue
+            group = self.results.get_group_of_duplicate(dupe)
+            if group is not None and group.ref is not dupe:
+                result.append(dupe)
+        return result
 
     def get_default(self, key, fallback_value=None):
         result = nonone(self.view.get_default(key), fallback_value)

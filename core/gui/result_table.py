@@ -107,8 +107,14 @@ class ResultTable(GUITable, DupeGuruGUIObject):
                 self.append(DupeRow(self, group, group.ref))
                 for dupe in group.dupes:
                     self.append(DupeRow(self, group, dupe))
+            for group in self.app.results.readonly_groups:
+                for dupe in group.dupes:
+                    self.append(DupeRow(self, group, dupe))
         else:
             for dupe in self.app.results.dupes:
+                group = self.app.results.get_group_of_duplicate(dupe)
+                self.append(DupeRow(self, group, dupe))
+            for dupe in self.app.results.readonly_dupes:
                 group = self.app.results.get_group_of_duplicate(dupe)
                 self.append(DupeRow(self, group, dupe))
 

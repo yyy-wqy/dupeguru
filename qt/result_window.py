@@ -6,7 +6,7 @@
 # which should be included with this package. The terms are also available at
 # http://www.gnu.org/licenses/gpl-3.0.html
 
-from PyQt5.QtCore import Qt, QRect
+from PyQt5.QtCore import Qt, QRect, QTimer
 from PyQt5.QtWidgets import (
     QMainWindow,
     QMenu,
@@ -28,6 +28,7 @@ from qt.util import move_to_screen_center, horizontal_wrap, create_actions
 from qt.search_edit import SearchEdit
 
 from core.app import AppMode
+from core.zip_scan import is_virtual_file
 from qt.results_model import ResultsView
 from qt.stats_label import StatsLabel
 from qt.prioritize_dialog import PrioritizeDialog
@@ -51,8 +52,12 @@ class ResultWindow(QMainWindow):
         else:
             MODEL_CLASS = ResultsModelStandard
         self.resultsModel = MODEL_CLASS(self.app, self.resultsView)
+        self.resultsView.selectionModel().selectionChanged.connect(
+            lambda *_args: QTimer.singleShot(0, self._update_selected_actions_status)
+        )
         self.stats = StatsLabel(app.model.stats_label, self.statusLabel)
         self._update_column_actions_status()
+        self._update_selected_actions_status()
 
         self.menuColumns.triggered.connect(self.columnToggled)
         self.resultsView.doubleClicked.connect(self.resultsDoubleClicked)
@@ -392,6 +397,22 @@ class ResultWindow(QMainWindow):
         menu_items = self.app.model.result_table._columns.menu_items()
         for action, (display, visible) in zip(self._column_actions, menu_items):
             action.setChecked(visible)
+
+    def _update_selected_actions_status(self):
+        selected = self.app.model.selected_dupes
+        has_real_selection = any(not is_virtual_file(dupe) for dupe in selected)
+        has_single_real_selection = len(selected) == 1 and has_real_selection
+        for action in (
+            self.actionRemoveSelected,
+            self.actionIgnoreSelected,
+            self.actionOpenSelected,
+            self.actionRevealSelected,
+            self.actionInvokeCustomCommand,
+            self.actionMarkSelected,
+        ):
+            action.setEnabled(has_real_selection)
+        self.actionMakeSelectedReference.setEnabled(has_single_real_selection)
+        self.actionRenameSelected.setEnabled(has_single_real_selection)
 
     # --- Actions
     def actionsTriggered(self):

@@ -14,6 +14,13 @@ from hscommon.util import dedupe, rem_file_ext, get_file_ext
 from hscommon.trans import tr
 
 from core import engine
+from core.zip_scan import (
+    DEFAULT_HARD_LIMIT,
+    DEFAULT_WARNING_LIMIT,
+    ZipAnalyzer,
+    is_virtual_file,
+    make_readonly_group,
+)
 
 # It's quite ugly to have scan types from all editions all put in the same class, but because there's
 # there will be some nasty bugs popping up (ScanType is used in core when in should exclusively be
@@ -75,6 +82,9 @@ def remove_dupe_paths(files):
 class Scanner:
     def __init__(self):
         self.discarded_file_count = 0
+        self.zip_problems = []
+        self.zip_subset_hints = []
+        self.readonly_groups = []
 
     def _getmatches(self, files, j):
         if (
@@ -118,10 +128,13 @@ class Scanner:
 
     @staticmethod
     def _key_func(dupe):
-        return -dupe.size
+        # Real filesystem objects must always precede read-only archive members.
+        return (is_virtual_file(dupe), -dupe.size)
 
     @staticmethod
     def _tie_breaker(ref, dupe):
+        if is_virtual_file(ref) != is_virtual_file(dupe):
+            return is_virtual_file(ref)
         refname = rem_file_ext(ref.name).lower()
         dupename = rem_file_ext(dupe.name).lower()
         if "copy" in dupename:
@@ -146,8 +159,23 @@ class Scanner:
         for f in (f for f in files if not hasattr(f, "is_ref")):
             f.is_ref = False
         files = remove_dupe_paths(files)
+        self.zip_problems = []
+        self.zip_subset_hints = []
+        self.readonly_groups = []
+        zip_matches = []
+        if self.scan_zip_contents and self.scan_type == ScanType.CONTENTS:
+            analysis = ZipAnalyzer(
+                warning_limit=self.zip_warning_limit,
+                hard_limit=self.zip_hard_limit,
+                threshold_decider=self.zip_threshold_decider,
+            ).analyze_files(files, j)
+            self.zip_problems = analysis.problems
+            self.zip_subset_hints = analysis.subset_hints
+            zip_matches = analysis.equivalence_matches
+            files.extend(analysis.virtual_members)
         logging.info("Getting matches. Scan type: %d", self.scan_type)
         matches = self._getmatches(files, j)
+        matches.extend(zip_matches)
         logging.info("Found %d matches" % len(matches))
         j.set_progress(100, tr("Almost done! Fiddling with results..."))
         # In removing what we call here "false matches", we first want to remove, if we scan by
@@ -178,6 +206,8 @@ class Scanner:
             matches = [m for m in matches if not ignore_list.are_ignored(str(m.first.path), str(m.second.path))]
         logging.info("Grouping matches")
         groups = engine.get_groups(matches)
+        self.readonly_groups = [make_readonly_group(g) for g in groups if all(is_virtual_file(f) for f in g)]
+        groups = [g for g in groups if any(not is_virtual_file(f) for f in g)]
         if self.scan_type in {
             ScanType.FILENAME,
             ScanType.FIELDS,
@@ -214,3 +244,7 @@ class Scanner:
     big_file_size_threshold = 0
     word_weighting = False
     include_exists_check = True
+    scan_zip_contents = True
+    zip_warning_limit = DEFAULT_WARNING_LIMIT
+    zip_hard_limit = DEFAULT_HARD_LIMIT
+    zip_threshold_decider = None

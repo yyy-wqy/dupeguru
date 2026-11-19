@@ -11,6 +11,7 @@ from PyQt5.QtGui import QBrush, QFont, QFontMetrics
 from PyQt5.QtWidgets import QTableView
 
 from qt.table import Table
+from core.zip_scan import is_virtual_file
 
 
 class ResultsModel(Table):
@@ -59,7 +60,7 @@ class ResultsModel(Table):
         if column.name == "marked":
             if row.markable:
                 flags |= Qt.ItemIsUserCheckable
-        elif column.name == "name":
+        elif column.name == "name" and not is_virtual_file(row._dupe):
             flags |= Qt.ItemIsEditable
         return flags
 

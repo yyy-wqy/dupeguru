@@ -11,6 +11,7 @@ import re
 import os
 import os.path as op
 from errno import EISDIR, EACCES
+from itertools import combinations
 from xml.etree import ElementTree as ET
 
 from hscommon.jobprogress.job import nulljob
@@ -20,6 +21,7 @@ from hscommon.trans import tr
 
 from core import engine
 from core.markable import Markable
+from core.zip_scan import ReadOnlyGroup, ZipMember, is_virtual_file
 
 
 class Results(Markable):
@@ -41,6 +43,7 @@ class Results(Markable):
     def __init__(self, app):
         Markable.__init__(self)
         self.__groups = []
+        self.__readonly_groups = []
         self.__group_of_duplicate = {}
         self.__groups_sort_descriptor = None  # This is a tuple (key, asc)
         self.__dupes = None
@@ -52,6 +55,7 @@ class Results(Markable):
         self.__marked_size = 0
         self.app = app
         self.problems = []  # (dupe, error_msg)
+        self.zip_subset_hints = []
         self.is_modified = False
         self.refresh_required = False
 
@@ -65,6 +69,8 @@ class Results(Markable):
         return self.__total_count
 
     def _is_markable(self, dupe):
+        if is_virtual_file(dupe):
+            return False
         if dupe.is_ref:
             return False
         g = self.get_group_of_duplicate(dupe)
@@ -153,6 +159,7 @@ class Results(Markable):
     def __set_groups(self, new_groups):
         self.mark_none()
         self.__groups = new_groups
+        self.__readonly_groups = []
         self.__group_of_duplicate = {}
         for g in self.__groups:
             for dupe in g:
@@ -164,6 +171,33 @@ class Results(Markable):
         self.apply_filter(None)
         for filter_str in old_filters:
             self.apply_filter(filter_str)
+
+    def __get_readonly_groups(self):
+        if self.__filters:
+            filters = [re.compile(filter_str, re.IGNORECASE) for filter_str in self.__filters]
+            return [
+                group
+                for group in self.__readonly_groups
+                if any(all(filter_re.search(str(dupe.path)) for filter_re in filters) for dupe in group)
+            ]
+        return self.__readonly_groups
+
+    def __get_readonly_dupes(self):
+        dupes = flatten(group.dupes for group in self.__readonly_groups)
+        if not self.__filters:
+            return dupes
+        filters = [re.compile(filter_str, re.IGNORECASE) for filter_str in self.__filters]
+        return [dupe for dupe in dupes if all(filter_re.search(str(dupe.path)) for filter_re in filters)]
+
+    def __set_readonly_groups(self, new_groups):
+        for group in self.__readonly_groups:
+            for dupe in group:
+                self.__group_of_duplicate.pop(dupe, None)
+        self.__readonly_groups = list(new_groups)
+        for group in self.__readonly_groups:
+            for dupe in group:
+                self.__group_of_duplicate[dupe] = group
+        self.is_modified = bool(self.__groups or self.__readonly_groups)
 
     # ---Public
     def apply_filter(self, filter_str):
@@ -227,6 +261,30 @@ class Results(Markable):
                 group.add_match(engine.get_match(ref_file, other_file))
             do_match(other_files[0], other_files[1:], group)
 
+        def load_file_element(file_elem):
+            if file_elem.get("type") == "zip-member":
+                container_path = file_elem.get("container_path")
+                member_path = file_elem.get("member_path")
+                if not container_path or not member_path or not os.path.isfile(container_path):
+                    return None
+                try:
+                    return ZipMember.from_metadata(
+                        container_path,
+                        member_path,
+                        int(file_elem.get("member_index", "0")),
+                        int(file_elem.get("size", "0")),
+                        file_elem.get("digest", ""),
+                        float(file_elem.get("mtime", "0")),
+                        file_elem.get("digest_partial"),
+                        file_elem.get("digest_samples"),
+                    )
+                except (TypeError, ValueError):
+                    return None
+            path = file_elem.get("path")
+            if not path:
+                return None
+            return get_file(path)
+
         self.apply_filter(None)
         root = ET.parse(infile).getroot()
         group_elems = list(root.iter("group"))
@@ -236,17 +294,14 @@ class Results(Markable):
             group = engine.Group()
             dupes = []
             for file_elem in group_elem.iter("file"):
-                path = file_elem.get("path")
                 words = file_elem.get("words", "")
-                if not path:
-                    continue
-                file = get_file(path)
+                file = load_file_element(file_elem)
                 if file is None:
                     continue
                 file.words = words.split(",")
-                file.is_ref = file_elem.get("is_ref") == "y"
+                file.is_ref = file_elem.get("is_ref") == "y" and not is_virtual_file(file)
                 dupes.append(file)
-                if file_elem.get("marked") == "y":
+                if file_elem.get("marked") == "y" and not is_virtual_file(file):
                     marked.add(file)
             for match_elem in group_elem.iter("match"):
                 try:
@@ -265,12 +320,22 @@ class Results(Markable):
                 groups.append(group)
             j.add_progress()
         self.groups = groups
+        readonly_groups = []
+        for group_elem in root.iter("readonly_group"):
+            dupes = [load_file_element(elem) for elem in group_elem.iter("file")]
+            dupes = [dupe for dupe in dupes if dupe is not None and is_virtual_file(dupe)]
+            if len(dupes) >= 2:
+                matches = [engine.Match(first, second, 100) for first, second in combinations(dupes, 2)]
+                readonly_groups.append(ReadOnlyGroup(dupes, matches))
+        self.readonly_groups = readonly_groups
         for dupe_file in marked:
             self.mark(dupe_file)
         self.is_modified = False
 
     def make_ref(self, dupe):
         """Make ``dupe`` take the :attr:`~core.engine.Group.ref` position of its group."""
+        if is_virtual_file(dupe):
+            return False
         g = self.get_group_of_duplicate(dupe)
         r = g.ref
         if not g.switch_ref(dupe):
@@ -345,28 +410,47 @@ class Results(Markable):
         """
         self.apply_filter(None)
         root = ET.Element("results")
+
+        def write_file_element(parent, d):
+            try:
+                words = engine.unpack_fields(d.words)
+            except AttributeError:
+                words = ()
+            file_elem = ET.SubElement(parent, "file")
+            try:
+                file_elem.set("path", str(d.path))
+                file_elem.set("words", ",".join(words))
+                if is_virtual_file(d):
+                    file_elem.set("type", "zip-member")
+                    file_elem.set("container_path", str(d.container_path))
+                    file_elem.set("member_path", d.member_path)
+                    file_elem.set("member_index", str(d.member_index))
+                    file_elem.set("size", str(d.size))
+                    file_elem.set("digest", d.digest.hex())
+                    file_elem.set("digest_partial", d.digest_partial.hex())
+                    file_elem.set("digest_samples", d.digest_samples.hex())
+                    file_elem.set("mtime", str(d.mtime))
+            except ValueError:  # If there's an invalid character, just skip the file
+                file_elem.set("path", "")
+            file_elem.set("is_ref", ("y" if d.is_ref and not is_virtual_file(d) else "n"))
+            file_elem.set("marked", ("y" if self.is_marked(d) and not is_virtual_file(d) else "n"))
+            return file_elem
+
         for g in self.groups:
             group_elem = ET.SubElement(root, "group")
             dupe2index = {}
             for index, d in enumerate(g):
                 dupe2index[d] = index
-                try:
-                    words = engine.unpack_fields(d.words)
-                except AttributeError:
-                    words = ()
-                file_elem = ET.SubElement(group_elem, "file")
-                try:
-                    file_elem.set("path", str(d.path))
-                    file_elem.set("words", ",".join(words))
-                except ValueError:  # If there's an invalid character, just skip the file
-                    file_elem.set("path", "")
-                file_elem.set("is_ref", ("y" if d.is_ref else "n"))
-                file_elem.set("marked", ("y" if self.is_marked(d) else "n"))
+                write_file_element(group_elem, d)
             for match in g.matches:
                 match_elem = ET.SubElement(group_elem, "match")
                 match_elem.set("first", str(dupe2index[match.first]))
                 match_elem.set("second", str(dupe2index[match.second]))
                 match_elem.set("percentage", str(int(match.percentage)))
+        for g in self.readonly_groups:
+            group_elem = ET.SubElement(root, "readonly_group")
+            for d in g:
+                write_file_element(group_elem, d)
         tree = ET.ElementTree(root)
 
         def do_write(outfile):
@@ -417,4 +501,6 @@ class Results(Markable):
     # ---Properties
     dupes = property(__get_dupe_list)
     groups = property(__get_groups, __set_groups)
+    readonly_groups = property(__get_readonly_groups, __set_readonly_groups)
+    readonly_dupes = property(__get_readonly_dupes)
     stat_line = property(__get_stat_line)
